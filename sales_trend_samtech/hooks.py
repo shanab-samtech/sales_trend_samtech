@@ -8,9 +8,9 @@ app_license = "mit"
 # Apps
 # ------------------
 
-fixtures = [
-    {"dt": "Custom Field", "filters": [["module", "=", "Sales Trend Samtech"]]},
-]
+# fixtures = [
+#     {"dt": "Custom Field", "filters": [["module", "=", "Sales Trend Samtech"]]},
+# ]
 
 # required_apps = []
 
