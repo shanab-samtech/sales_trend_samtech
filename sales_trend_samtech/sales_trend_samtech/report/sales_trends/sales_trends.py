@@ -94,9 +94,13 @@ def get_data(filters, conditions):
 	if conditions.get("trans") == "Quotation" and filters.get("group_by") == "Customer":
 		cond += " and t1.quotation_to = 'Customer'"
 
-	# Add industry filter
 	if filters.get("industry") and filters.get("based_on") == "Customer":
-		cond += " and t1.customer in (select name from `tabCustomer` where industry = %(industry)s)"
+		cond += """ and EXISTS (
+			SELECT 1 FROM `tabIndustry Type Detail` itl 
+			WHERE itl.parent = t1.customer 
+			AND itl.parenttype = 'Customer'
+			AND itl.industry_type_detail = %(industry)s
+		)"""
 	
 	# Add item filter
 	if filters.get("item"):
@@ -157,7 +161,7 @@ def get_data(filters, conditions):
 		)
 
 		for d in range(len(data1)):
-			# to add blanck column
+			# to add blank column
 			dt = data1[d]
 			dt.insert(ind, "")
 			data.append(dt)
@@ -244,44 +248,49 @@ def get_inactive_customers(filters, conditions):
 	if filters.period_based_on:
 		posting_date = filters.period_based_on
 	
-	# Build item conditions
-	item_cond = ""
-	if filters.get("item"):
-		item_cond += " and si_item.item_code = %(item)s"
-	if filters.get("item_group"):
-		item_cond += " and si_item.item_group = %(item_group)s"
-	
-	# Get all customers
-	customer_filters = {"disabled": 0}
+	# Get all customers (filter by industry if specified using child table)
 	if filters.get("industry"):
-		customer_filters["industry"] = filters.get("industry")
+		# Get customers that have the selected industry in their child
+		customer_list = frappe.db.sql("""
+			SELECT DISTINCT itl.parent
+			FROM `tabIndustry Type Detail` itl
+			WHERE itl.parenttype = 'Customer'
+			AND itl.industry_type_detail = %(industry)s
+		""", {'industry': filters.get("industry")}, as_list=1)
+		
+		if customer_list:
+			customer_names = [c[0] for c in customer_list]
+			all_customers = frappe.get_all(
+				"Customer",
+				filters={"disabled": 0, "name": ["in", customer_names]},
+				fields=["name", "customer_name", "territory"]
+			)
+		else:
+			# No customers with this industry
+			all_customers = []
+	else:
+		# Get all active customers
+		all_customers = frappe.get_all(
+			"Customer",
+			filters={"disabled": 0},
+			fields=["name", "customer_name", "territory"]
+		)
 	
-	all_customers = frappe.get_all(
-		"Customer",
-		filters=customer_filters,
-		fields=["name", "customer_name", "territory"]
-	)
-	
-	# Get customers with transactions
+	# Get customers with ANY transactions in the period (ignore item/item_group filters)
 	active_customers = frappe.db.sql("""
 		SELECT DISTINCT si.customer
 		FROM `tabSales Invoice` si
-		INNER JOIN `tabSales Invoice Item` si_item ON si_item.parent = si.name
 		WHERE si.company = %(company)s
 		AND si.{posting_date} BETWEEN %(year_start_date)s AND %(year_end_date)s
 		AND si.docstatus = 1
-		{item_cond}
-	""".format(posting_date=posting_date, item_cond=item_cond), {
+	""".format(posting_date=posting_date), {
 		'company': filters.get("company"),
 		'year_start_date': year_start_date,
-		'year_end_date': year_end_date,
-		'item': filters.get("item"),
-		'item_group': filters.get("item_group")
+		'year_end_date': year_end_date
 	}, as_dict=1)
 	
 	active_customer_set = {c.customer for c in active_customers}
 	
-	# Get inactive customers
 	inactive_customers = [c for c in all_customers if c.name not in active_customer_set]
 	
 	# Build result with zeros for all periods
@@ -396,7 +405,6 @@ def get_period_month_ranges(period, fiscal_year):
 def based_wise_columns_query(based_on, trans):
 	based_on_details = {}
 
-	# based_on_cols, based_on_select, based_on_group_by, addl_tables
 	if based_on == "Item":
 		based_on_details["based_on_cols"] = ["Item:Link/Item:120", "Item Name:Data:120"]
 		based_on_details["based_on_select"] = "t2.item_code, t2.item_name,"
