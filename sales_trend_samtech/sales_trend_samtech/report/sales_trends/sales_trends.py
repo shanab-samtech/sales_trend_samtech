@@ -139,8 +139,10 @@ def build_base_filters(filters, conditions, year_start_date, year_end_date, post
 
 def get_parent_documents(trans, base_filters, filters, conditions):
     """
-    Get parent transaction documents using frappe.get_all()
+    Get parent transaction documents using frappe.get_list()
     which automatically applies user permissions.
+
+    CRITICAL: Must use get_list() not get_all() to enforce user permissions!
     """
     # Determine the date field to fetch
     posting_date_field = get_posting_date_field(filters, trans)
@@ -155,12 +157,13 @@ def get_parent_documents(trans, base_filters, filters, conditions):
     elif trans in ["Purchase Order", "Purchase Invoice", "Purchase Receipt"]:
         fields.extend(["supplier", "supplier_name"])
 
-    # Get all parent documents with user permissions enforced
-    parent_docs = frappe.get_all(
+    # CRITICAL: Use get_list() to apply user permissions automatically
+    parent_docs = frappe.get_list(
         trans,
         filters=base_filters,
         fields=fields,
-        limit_page_length=0
+        limit_page_length=0,
+        ignore_permissions=False  # Explicitly enforce permissions
     )
 
     if not parent_docs:
@@ -176,7 +179,7 @@ def get_parent_documents(trans, base_filters, filters, conditions):
     # Get parent document names for child item query
     parent_names = [doc["name"] for doc in parent_docs]
 
-    # Get child items with user permissions
+    # Get child items - child tables don't have user permissions, but parent filtering already applied
     item_child_doctype = f"{trans} Item"
     item_filters = {"parent": ["in", parent_names]}
 
@@ -191,6 +194,7 @@ def get_parent_documents(trans, base_filters, filters, conditions):
 
     item_fields = ["parent", "item_code", "item_name", "item_group", "stock_qty", "project"]
 
+    # Child tables don't need permission check since parent is already filtered
     child_items = frappe.get_all(
         item_child_doctype,
         filters=item_filters,
@@ -224,6 +228,7 @@ def get_parent_documents(trans, base_filters, filters, conditions):
 def filter_by_industry(parent_docs, industry, trans):
     """Filter customers by industry using ORM"""
     # Get customers that have the specified industry
+    # Child table, no user permissions needed
     industry_customers = frappe.get_all(
         "Industry Type Detail",
         filters={
@@ -250,10 +255,12 @@ def enrich_with_supplier_group(parent_docs):
     """Add supplier_group to parent documents"""
     supplier_names = list(set([doc.get("supplier") for doc in parent_docs if doc.get("supplier")]))
     if supplier_names:
-        suppliers = frappe.get_all(
+        # Use get_list to respect supplier permissions
+        suppliers = frappe.get_list(
             "Supplier",
             filters={"name": ["in", supplier_names]},
-            fields=["name", "supplier_group"]
+            fields=["name", "supplier_group"],
+            ignore_permissions=False
         )
         supplier_map = {s.name: s.supplier_group for s in suppliers}
         for doc in parent_docs:
@@ -314,6 +321,10 @@ def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, post
 
     # Calculate period-wise quantities
     for key, group_info in grouped_data.items():
+        # Skip empty groups (no items/transactions)
+        if not group_info.get("items"):
+            continue
+
         # Build row based on based_on type
         if based_on == "Item":
             row = [group_info["item_info"].item_code, group_info["item_info"].item_name]
@@ -346,7 +357,10 @@ def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, post
             row.append(total_qty)
 
         row.append(total_qty)
-        data.append(row)
+
+        # Only add row if there's actual quantity (skip zero-value rows)
+        if total_qty > 0:
+            data.append(row)
 
     return data
 
@@ -436,6 +450,10 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
 
     # Build output rows
     for based_on_key, group_info in grouped_data.items():
+        # Skip empty groups
+        if not group_info.get("subgroups"):
+            continue
+
         # First add the summary row for this based_on group
         if based_on == "Item":
             summary_row = [group_info["item_info"].item_code, group_info["item_info"].item_name]
@@ -466,41 +484,44 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
                 else:
                     summary_period_qtys[0] += qty
 
-        summary_row.extend(summary_period_qtys)
-        summary_row.append(summary_total)
-        summary_row.insert(ind, "")  # Empty slot for group_by column
-        data.append(summary_row)
+        # Only add summary row if there's actual quantity
+        if summary_total > 0:
+            summary_row.extend(summary_period_qtys)
+            summary_row.append(summary_total)
+            summary_row.insert(ind, "")  # Empty slot for group_by column
+            data.append(summary_row)
 
-        # Now add detail rows for each subgroup
-        for group_by_key, items_data in group_info["subgroups"].items():
-            detail_row = [""] * len(conditions["columns"])
-            detail_row[ind] = group_by_key
-
-            if filters.get("period") != "Yearly":
-                period_qtys = [0.0] * len(period_ranges)
-            else:
-                period_qtys = [0.0]
-
-            detail_total = 0.0
-
-            for item_data in items_data:
-                qty = item_data["item"].stock_qty or 0.0
-                detail_total += qty
+            # Now add detail rows for each subgroup
+            for group_by_key, items_data in group_info["subgroups"].items():
+                detail_row = [""] * len(conditions["columns"])
+                detail_row[ind] = group_by_key
 
                 if filters.get("period") != "Yearly":
-                    parent_date = item_data["parent_date"]
-                    for idx, (start_date, end_date) in enumerate(period_ranges):
-                        if start_date <= parent_date <= end_date:
-                            period_qtys[idx] += qty
-                            break
+                    period_qtys = [0.0] * len(period_ranges)
                 else:
-                    period_qtys[0] += qty
+                    period_qtys = [0.0]
 
-            for j in range(len(period_qtys)):
-                detail_row[j + inc] = period_qtys[j]
-            detail_row[-1] = detail_total
+                detail_total = 0.0
 
-            data.append(detail_row)
+                for item_data in items_data:
+                    qty = item_data["item"].stock_qty or 0.0
+                    detail_total += qty
+
+                    if filters.get("period") != "Yearly":
+                        parent_date = item_data["parent_date"]
+                        for idx, (start_date, end_date) in enumerate(period_ranges):
+                            if start_date <= parent_date <= end_date:
+                                period_qtys[idx] += qty
+                                break
+                    else:
+                        period_qtys[0] += qty
+
+                # Only add detail row if there's quantity
+                if detail_total > 0:
+                    for j in range(len(period_qtys)):
+                        detail_row[j + inc] = period_qtys[j]
+                    detail_row[-1] = detail_total
+                    data.append(detail_row)
 
     return data
 
@@ -579,6 +600,7 @@ def get_inactive_customers(filters, conditions):
 
     if filters.get("industry"):
         # Get customers that have the specified industry using ORM
+        # Child table, no user permissions
         industry_customers = frappe.get_all(
             "Industry Type Detail",
             filters={
@@ -590,11 +612,13 @@ def get_inactive_customers(filters, conditions):
         # Add industry filter to customer query
         customer_filters["name"] = ["in", industry_customers]
 
+    # CRITICAL: Use get_list() to respect user permissions on Customer
     all_customers = frappe.get_list(
         "Customer",
         filters=customer_filters,
         fields=["name", "customer_name", "territory"],
         limit_page_length=0,
+        ignore_permissions=False
     )
 
     if not all_customers:
@@ -603,9 +627,9 @@ def get_inactive_customers(filters, conditions):
     # Get list of permitted customer names
     permitted_customer_names = [c["name"] for c in all_customers]
 
-    # Get active customers using frappe.get_all() which respects permissions
+    # Get active customers using frappe.get_list() which respects permissions
     # Only check within the permitted customers list
-    active_customers_data = frappe.get_all(
+    active_customers_data = frappe.get_list(
         "Sales Invoice",
         filters={
             "company": filters.get("company"),
@@ -615,7 +639,8 @@ def get_inactive_customers(filters, conditions):
         },
         fields=["customer"],
         distinct=True,
-        limit_page_length=0
+        limit_page_length=0,
+        ignore_permissions=False
     )
 
     active_customer_set = {c.customer for c in active_customers_data}
