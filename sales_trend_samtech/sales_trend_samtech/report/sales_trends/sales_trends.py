@@ -195,11 +195,11 @@ def get_parent_documents(trans, base_filters, filters, conditions):
     # Enrich parent documents with their items
     parent_dict = {doc.name: doc for doc in parent_docs}
     for parent_doc in parent_dict.values():
-        parent_doc.items = []
+        parent_doc["items"] = []
 
     for item in child_items:
         if item.parent in parent_dict:
-            parent_dict[item.parent].items.append(item)
+            parent_dict[item.parent]["items"].append(item)
 
     # Filter out parents with no matching items
     parent_docs = [doc for doc in parent_docs if doc.get("items")]
@@ -230,7 +230,7 @@ def filter_by_industry(parent_docs, industry, trans):
     filtered_docs = []
     for doc in parent_docs:
         customer_field = "party_name" if trans == "Quotation" else "customer"
-        if hasattr(doc, customer_field) and getattr(doc, customer_field) in industry_customer_set:
+        if doc.get(customer_field) and doc.get(customer_field) in industry_customer_set:
             filtered_docs.append(doc)
 
     return filtered_docs
@@ -238,7 +238,7 @@ def filter_by_industry(parent_docs, industry, trans):
 
 def enrich_with_supplier_group(parent_docs):
     """Add supplier_group to parent documents"""
-    supplier_names = list(set([doc.supplier for doc in parent_docs if hasattr(doc, "supplier")]))
+    supplier_names = list(set([doc.get("supplier") for doc in parent_docs if doc.get("supplier")]))
     if supplier_names:
         suppliers = frappe.get_all(
             "Supplier",
@@ -247,8 +247,8 @@ def enrich_with_supplier_group(parent_docs):
         )
         supplier_map = {s.name: s.supplier_group for s in suppliers}
         for doc in parent_docs:
-            if hasattr(doc, "supplier"):
-                doc.supplier_group = supplier_map.get(doc.supplier, "")
+            if doc.get("supplier"):
+                doc["supplier_group"] = supplier_map.get(doc.get("supplier"), "")
 
 
 def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, posting_date_field, trans):
@@ -262,7 +262,7 @@ def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, post
     for parent_doc in parent_docs:
         # For Item and Item Group, we group by item-level fields
         if based_on == "Item":
-            for item in parent_doc.items:
+            for item in parent_doc.get("items", []):
                 based_on_key = item.item_code
                 if based_on_key not in grouped_data:
                     grouped_data[based_on_key] = {
@@ -271,10 +271,10 @@ def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, post
                     }
                 grouped_data[based_on_key]["items"].append({
                     "item": item,
-                    "parent_date": getattr(parent_doc, posting_date_field)
+                    "parent_date": parent_doc.get(posting_date_field)
                 })
         elif based_on == "Item Group":
-            for item in parent_doc.items:
+            for item in parent_doc.get("items", []):
                 based_on_key = item.item_group
                 if based_on_key not in grouped_data:
                     grouped_data[based_on_key] = {
@@ -283,7 +283,7 @@ def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, post
                     }
                 grouped_data[based_on_key]["items"].append({
                     "item": item,
-                    "parent_date": getattr(parent_doc, posting_date_field)
+                    "parent_date": parent_doc.get(posting_date_field)
                 })
         else:
             # For parent-level fields (Customer, Territory, etc.)
@@ -296,10 +296,10 @@ def process_ungrouped_data(parent_docs, filters, conditions, period_ranges, post
                 }
 
             # Add items to this group
-            for item in parent_doc.items:
+            for item in parent_doc.get("items", []):
                 grouped_data[based_on_key]["items"].append({
                     "item": item,
-                    "parent_date": getattr(parent_doc, posting_date_field)
+                    "parent_date": parent_doc.get(posting_date_field)
                 })
 
     # Calculate period-wise quantities
@@ -353,7 +353,7 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
     for parent_doc in parent_docs:
         # Handle Item and Item Group based_on
         if based_on == "Item":
-            for item in parent_doc.items:
+            for item in parent_doc.get("items", []):
                 based_on_key = item.item_code
                 if based_on_key not in grouped_data:
                     grouped_data[based_on_key] = {
@@ -369,11 +369,11 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
 
                 grouped_data[based_on_key]["subgroups"][group_by_key].append({
                     "item": item,
-                    "parent_date": getattr(parent_doc, posting_date_field)
+                    "parent_date": parent_doc.get(posting_date_field)
                 })
 
         elif based_on == "Item Group":
-            for item in parent_doc.items:
+            for item in parent_doc.get("items", []):
                 based_on_key = item.item_group
                 if based_on_key not in grouped_data:
                     grouped_data[based_on_key] = {
@@ -389,7 +389,7 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
 
                 grouped_data[based_on_key]["subgroups"][group_by_key].append({
                     "item": item,
-                    "parent_date": getattr(parent_doc, posting_date_field)
+                    "parent_date": parent_doc.get(posting_date_field)
                 })
 
         else:
@@ -403,7 +403,7 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
                 }
 
             # Now group by the group_by field
-            for item in parent_doc.items:
+            for item in parent_doc.get("items", []):
                 group_by_key = get_group_by_value(parent_doc, item, group_by, trans)
 
                 if group_by_key not in grouped_data[based_on_key]["subgroups"]:
@@ -411,7 +411,7 @@ def process_grouped_data(parent_docs, filters, conditions, period_ranges, postin
 
                 grouped_data[based_on_key]["subgroups"][group_by_key].append({
                     "item": item,
-                    "parent_date": getattr(parent_doc, posting_date_field)
+                    "parent_date": parent_doc.get(posting_date_field)
                 })
 
     # Determine column index for group_by insertion
@@ -503,17 +503,17 @@ def get_based_on_value(parent_doc, based_on, trans):
     elif based_on == "Item Group":
         return None  # Handled via items
     elif based_on == "Customer":
-        return parent_doc.party_name if trans == "Quotation" else parent_doc.customer
+        return parent_doc.get("party_name") if trans == "Quotation" else parent_doc.get("customer")
     elif based_on == "Customer Group":
-        return parent_doc.customer_group
+        return parent_doc.get("customer_group")
     elif based_on == "Supplier":
-        return parent_doc.supplier
+        return parent_doc.get("supplier")
     elif based_on == "Supplier Group":
-        return parent_doc.supplier_group
+        return parent_doc.get("supplier_group")
     elif based_on == "Territory":
-        return parent_doc.territory
+        return parent_doc.get("territory")
     elif based_on == "Project":
-        return parent_doc.project if hasattr(parent_doc, "project") else None
+        return parent_doc.get("project")
     return None
 
 
@@ -523,20 +523,19 @@ def build_row_from_based_on(parent_doc, based_on, trans):
 
     if based_on == "Customer":
         if trans == "Quotation":
-            row = [parent_doc.party_name, parent_doc.customer_name, parent_doc.territory]
+            row = [parent_doc.get("party_name"), parent_doc.get("customer_name"), parent_doc.get("territory")]
         else:
-            row = [parent_doc.customer, parent_doc.customer_name, parent_doc.territory]
+            row = [parent_doc.get("customer"), parent_doc.get("customer_name"), parent_doc.get("territory")]
     elif based_on == "Customer Group":
-        row = [parent_doc.customer_group]
+        row = [parent_doc.get("customer_group")]
     elif based_on == "Supplier":
-        row = [parent_doc.supplier, parent_doc.supplier_name, parent_doc.supplier_group]
+        row = [parent_doc.get("supplier"), parent_doc.get("supplier_name"), parent_doc.get("supplier_group")]
     elif based_on == "Supplier Group":
-        row = [parent_doc.supplier_group]
+        row = [parent_doc.get("supplier_group")]
     elif based_on == "Territory":
-        row = [parent_doc.territory]
+        row = [parent_doc.get("territory")]
     elif based_on == "Project":
-        project = parent_doc.project if hasattr(parent_doc, "project") else ""
-        row = [project]
+        row = [parent_doc.get("project", "")]
 
     return row
 
@@ -546,9 +545,9 @@ def get_group_by_value(parent_doc, item, group_by, trans):
     if group_by == "Item":
         return item.item_code
     elif group_by == "Customer":
-        return parent_doc.party_name if trans == "Quotation" else parent_doc.customer
+        return parent_doc.get("party_name") if trans == "Quotation" else parent_doc.get("customer")
     elif group_by == "Supplier":
-        return parent_doc.supplier
+        return parent_doc.get("supplier")
     return None
 
 
