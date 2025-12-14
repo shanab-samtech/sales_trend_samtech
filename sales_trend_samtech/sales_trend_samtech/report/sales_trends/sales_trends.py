@@ -142,7 +142,10 @@ def get_parent_documents(trans, base_filters, filters, conditions):
     Get parent transaction documents using frappe.get_all()
     which automatically applies user permissions.
     """
-    fields = ["name", "company"]
+    # Determine the date field to fetch
+    posting_date_field = get_posting_date_field(filters, trans)
+
+    fields = ["name", "company", posting_date_field]
 
     # Add fields based on transaction type and filters
     if trans == "Quotation":
@@ -167,8 +170,11 @@ def get_parent_documents(trans, base_filters, filters, conditions):
     if filters.get("industry") and filters.get("based_on") == "Customer":
         parent_docs = filter_by_industry(parent_docs, filters.get("industry"), trans)
 
+    if not parent_docs:
+        return []
+
     # Get parent document names for child item query
-    parent_names = [doc.name for doc in parent_docs]
+    parent_names = [doc["name"] for doc in parent_docs]
 
     # Get child items with user permissions
     item_child_doctype = f"{trans} Item"
@@ -193,16 +199,20 @@ def get_parent_documents(trans, base_filters, filters, conditions):
     )
 
     # Enrich parent documents with their items
-    parent_dict = {doc.name: doc for doc in parent_docs}
-    for parent_doc in parent_dict.values():
-        parent_doc["items"] = []
+    # Initialize items list for all parent docs
+    for doc in parent_docs:
+        doc["items"] = []
 
+    # Create lookup dictionary
+    parent_dict = {doc["name"]: doc for doc in parent_docs}
+
+    # Add items to parent documents
     for item in child_items:
-        if item.parent in parent_dict:
-            parent_dict[item.parent]["items"].append(item)
+        if item["parent"] in parent_dict:
+            parent_dict[item["parent"]]["items"].append(item)
 
     # Filter out parents with no matching items
-    parent_docs = [doc for doc in parent_docs if doc.get("items")]
+    parent_docs = [doc for doc in parent_docs if len(doc.get("items", [])) > 0]
 
     # Enrich with supplier group if needed
     if conditions.get("addl_tables") and "tabSupplier" in conditions["addl_tables"]:
