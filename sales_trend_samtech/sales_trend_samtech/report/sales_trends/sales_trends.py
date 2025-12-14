@@ -4,6 +4,85 @@
 import frappe
 from frappe import _
 from frappe.utils import getdate
+from frappe.permissions import get_permission_query_conditions as _pqc
+
+def _perm_cond_for_main(trans: str) -> str:
+    """Permission condition for the main/parent doctype (aliased as t1)."""
+    s = _pqc(trans) or ""
+    # PQC strings reference backticked full table names like `tabSales Invoice`.
+    # Since you aliased that table to t1, rewrite to t1.
+    if s:
+        s = s.replace(f"`tab{trans}`", "t1")
+    return s
+
+def _exists_pqc(child_doctype: str, field_on_t, ref_field: str) -> str:
+    """
+    Build EXISTS(...) condition to enforce PQC of a referenced DocType.
+
+    Example:
+      _exists_pqc("Customer", "t1", "customer")
+      -> EXISTS(SELECT 1 FROM `tabCustomer` cu WHERE cu.name = t1.customer AND <PQC(Customer)>)
+    """
+    s = _pqc(child_doctype)
+    if not s:
+        return ""
+    # PQC inside EXISTS should still reference its own backticked table name.
+    # We'll bind a short alias (cu/it/su/te/pr/cg) but PQC uses backticked `tabX`, which is valid within the EXISTS FROM.
+    alias = {
+        "Customer": "cu",
+        "Item": "it",
+        "Supplier": "su",
+        "Territory": "te",
+        "Project": "pr",
+        "Customer Group": "cg",
+    }.get(child_doctype, "x")
+    return (
+        f"EXISTS (SELECT 1 FROM `tab{child_doctype}` {alias} "
+        f"WHERE {alias}.name = {field_on_t}.{frappe.db.escape(ref_field)} "
+        f"AND {s})"
+    )
+
+def build_user_permission_sql(trans: str, include_customer_group: bool = False, sales_flow: bool = False, purchase_flow: bool = False) -> str:
+    """
+    Return a single 'AND (...)' clause combining all applicable permission checks
+    for the current report query, covering parent (t1), items (t2), and referenced masters.
+    """
+    parts = []
+
+    # 1) Parent doctype perms (t1)
+    s = _perm_cond_for_main(trans)
+    if s:
+        parts.append(f"({s})")
+
+    # 2) Item master perms (via t2.item_code -> Item)
+    s = _exists_pqc("Item", "t2", "item_code")
+    if s:
+        parts.append(s)
+
+    # 3) Sales flow refs (Customer, Territory, Project on t1)
+    if sales_flow:
+        s = _exists_pqc("Customer", "t1", "customer")
+        if s: parts.append(s)
+        s = _exists_pqc("Territory", "t1", "territory")
+        if s: parts.append(s)
+        s = _exists_pqc("Project", "t1", "project")
+        if s: parts.append(s)
+
+    # 4) Purchase flow refs (Supplier on t1, Project on t2)
+    if purchase_flow:
+        s = _exists_pqc("Supplier", "t1", "supplier")
+        if s: parts.append(s)
+        s = _exists_pqc("Project", "t2", "project")
+        if s: parts.append(s)
+
+    # 5) Customer Group perms if report is based on or grouped by it
+    if include_customer_group:
+        s = _exists_pqc("Customer Group", "t1", "customer_group")
+        if s: parts.append(s)
+
+    if not parts:
+        return ""
+    return " AND (" + " AND ".join(parts) + ")"
 
 def execute(filters=None):
 	if not filters:
@@ -64,252 +143,257 @@ def validate_filters(filters):
 
 
 def get_data(filters, conditions):
-	data = []
-	
-	# Handle inactive customers
-	if filters.get("based_on") == "Customer" and filters.get("inactive_customers"):
-		return get_inactive_customers(filters, conditions)
-	
-	inc, cond = "", ""
-	query_details = conditions["based_on_select"] + conditions["period_wise_select"]
+    data = []
 
-	posting_date = "t1.transaction_date"
-	if conditions.get("trans") in [
-		"Sales Invoice",
-		"Purchase Invoice",
-		"Purchase Receipt",
-		"Delivery Note",
-	]:
-		posting_date = "t1.posting_date"
-		if filters.period_based_on and conditions.get("trans") in ["Sales Invoice", "Purchase Invoice"]:
-			posting_date = "t1." + filters.period_based_on
+    # Handle inactive customers branch first (we'll fix that function next)
+    if filters.get("based_on") == "Customer" and filters.get("inactive_customers"):
+        return get_inactive_customers(filters, conditions)
 
-	if conditions["based_on_select"] in ["t1.project,", "t2.project,"]:
-		cond = " and " + conditions["based_on_select"][:-1] + " IS Not NULL"
+    inc, cond = "", ""
+    query_details = conditions["based_on_select"] + conditions["period_wise_select"]
 
-	if not filters.get("include_closed_orders"):
-		if conditions.get("trans") in ["Sales Order", "Purchase Order"]:
-			cond += " and t1.status != 'Closed'"
+    posting_date = "t1.transaction_date"
+    if conditions.get("trans") in ["Sales Invoice", "Purchase Invoice", "Purchase Receipt", "Delivery Note"]:
+        posting_date = "t1.posting_date"
+        if filters.period_based_on and conditions.get("trans") in ["Sales Invoice", "Purchase Invoice"]:
+            posting_date = "t1." + filters.period_based_on
 
-	if conditions.get("trans") == "Quotation" and filters.get("group_by") == "Customer":
-		cond += " and t1.quotation_to = 'Customer'"
+    if conditions["based_on_select"] in ["t1.project,", "t2.project,"]:
+        cond = " and " + conditions["based_on_select"][:-1] + " IS Not NULL"
 
-	if filters.get("industry") and filters.get("based_on") == "Customer":
-		cond += """ and EXISTS (
-			SELECT 1 FROM `tabIndustry Type Detail` itl 
-			WHERE itl.parent = t1.customer 
-			AND itl.parenttype = 'Customer'
-			AND itl.industry_type_detail = %(industry)s
-		)"""
-	
-	# Add item filter
-	if filters.get("item"):
-		cond += " and t2.item_code = %(item)s"
-	
-	# Add item group filter
-	if filters.get("item_group"):
-		cond += " and t2.item_group = %(item_group)s"
+    if not filters.get("include_closed_orders"):
+        if conditions.get("trans") in ["Sales Order", "Purchase Order"]:
+            cond += " and t1.status != 'Closed'"
 
-	year_start_date, year_end_date = frappe.get_cached_value(
-		"Fiscal Year", filters.get("fiscal_year"), ["year_start_date", "year_end_date"]
-	)
+    if conditions.get("trans") == "Quotation" and filters.get("group_by") == "Customer":
+        cond += " and t1.quotation_to = 'Customer'"
 
-	sql_params = {
-		'company': filters.get("company"),
-		'year_start_date': year_start_date,
-		'year_end_date': year_end_date,
-		'industry': filters.get("industry"),
-		'item': filters.get("item"),
-		'item_group': filters.get("item_group")
-	}
+    if filters.get("industry") and filters.get("based_on") == "Customer":
+        cond += """ and EXISTS (
+            SELECT 1 FROM `tabIndustry Type Detail` itl 
+            WHERE itl.parent = t1.customer 
+              AND itl.parenttype = 'Customer'
+              AND itl.industry_type_detail = %(industry)s
+        )"""
 
-	if filters.get("group_by"):
-		sel_col = ""
-		ind = conditions["columns"].index(conditions["grbc"][0])
+    if filters.get("item"):
+        cond += " and t2.item_code = %(item)s"
+    if filters.get("item_group"):
+        cond += " and t2.item_group = %(item_group)s"
 
-		if filters.get("group_by") == "Item":
-			sel_col = "t2.item_code"
-		elif filters.get("group_by") == "Customer":
-			sel_col = "t1.party_name" if conditions.get("trans") == "Quotation" else "t1.customer"
-		elif filters.get("group_by") == "Supplier":
-			sel_col = "t1.supplier"
+    # ----- NEW: user-permission enforcement -----
+    trans = conditions.get("trans")
+    is_sales = trans in ["Sales Invoice", "Delivery Note", "Sales Order", "Quotation"]
+    is_purchase = trans in ["Purchase Order", "Purchase Invoice", "Purchase Receipt"]
+    include_cg = (filters.get("based_on") == "Customer Group") or (filters.get("group_by") == "Customer Group")
 
-		if filters.get("based_on") in ["Customer", "Supplier"]:
-			inc = 3
-		elif filters.get("based_on") in ["Item"]:
-			inc = 2
-		else:
-			inc = 1
+    perm_sql = build_user_permission_sql(
+        trans=trans,
+        include_customer_group=include_cg,
+        sales_flow=is_sales,
+        purchase_flow=is_purchase,
+    )
+    cond += perm_sql
+    # -------------------------------------------
 
-		data1 = frappe.db.sql(
-			""" select {} from `tab{}` t1, `tab{} Item` t2 {}
-					where t2.parent = t1.name and t1.company = %(company)s and {} between %(year_start_date)s and %(year_end_date)s and
-					t1.docstatus = 1 {} {}
-					group by {}
-				""".format(
-				query_details,
-				conditions["trans"],
-				conditions["trans"],
-				conditions["addl_tables"],
-				posting_date,
-				conditions.get("addl_tables_relational_cond"),
-				cond,
-				conditions["group_by"],
-			),
-			sql_params,
-			as_list=1,
-		)
+    year_start_date, year_end_date = frappe.get_cached_value(
+        "Fiscal Year", filters.get("fiscal_year"), ["year_start_date", "year_end_date"]
+    )
 
-		for d in range(len(data1)):
-			# to add blank column
-			dt = data1[d]
-			dt.insert(ind, "")
-			data.append(dt)
+    sql_params = {
+        'company': filters.get("company"),
+        'year_start_date': year_start_date,
+        'year_end_date': year_end_date,
+        'industry': filters.get("industry"),
+        'item': filters.get("item"),
+        'item_group': filters.get("item_group")
+    }
 
-			# to get distinct value of col specified by group_by in filter
-			row = frappe.db.sql(
-				"""select DISTINCT({}) from `tab{}` t1, `tab{} Item` t2 {}
-						where t2.parent = t1.name and t1.company = %(company)s and {} between %(year_start_date)s and %(year_end_date)s
-						and t1.docstatus = 1 and {} = %(group_val)s {} {}
-					""".format(
-					sel_col,
-					conditions["trans"],
-					conditions["trans"],
-					conditions["addl_tables"],
-					posting_date,
-					conditions["group_by"],
-					conditions.get("addl_tables_relational_cond"),
-					cond,
-				),
-				dict(sql_params, group_val=data1[d][0]),
-				as_list=1,
-			)
+    if filters.get("group_by"):
+        sel_col = ""
+        ind = conditions["columns"].index(conditions["grbc"][0])
 
-			for i in range(len(row)):
-				des = ["" for q in range(len(conditions["columns"]))]
+        if filters.get("group_by") == "Item":
+            sel_col = "t2.item_code"
+        elif filters.get("group_by") == "Customer":
+            sel_col = "t1.party_name" if trans == "Quotation" else "t1.customer"
+        elif filters.get("group_by") == "Supplier":
+            sel_col = "t1.supplier"
 
-				# get data for group_by filter
-				row1 = frappe.db.sql(
-					""" select {} , {} from `tab{}` t1, `tab{} Item` t2 {}
-							where t2.parent = t1.name and t1.company = %(company)s and {} between %(year_start_date)s and %(year_end_date)s
-							and t1.docstatus = 1 and {} = %(sel_val)s and {} = %(group_val)s {} {}
-						""".format(
-						sel_col,
-						conditions["period_wise_select"],
-						conditions["trans"],
-						conditions["trans"],
-						conditions["addl_tables"],
-						posting_date,
-						sel_col,
-						conditions["group_by"],
-						conditions.get("addl_tables_relational_cond"),
-						cond,
-					),
-					dict(sql_params, sel_val=row[i][0], group_val=data1[d][0]),
-					as_list=1,
-				)
+        if filters.get("based_on") in ["Customer", "Supplier"]:
+            inc = 3
+        elif filters.get("based_on") in ["Item"]:
+            inc = 2
+        else:
+            inc = 1
 
-				des[ind] = row[i][0]
+        data1 = frappe.db.sql(
+            """ select {} from `tab{}` t1, `tab{} Item` t2 {}
+                where t2.parent = t1.name and t1.company = %(company)s
+                  and {} between %(year_start_date)s and %(year_end_date)s
+                  and t1.docstatus = 1 {} {}
+                group by {}
+            """.format(
+                query_details,
+                trans,
+                trans,
+                conditions["addl_tables"],
+                posting_date,
+                conditions.get("addl_tables_relational_cond", ""),
+                cond,
+                conditions["group_by"],
+            ),
+            sql_params,
+            as_list=1,
+        )
 
-				for j in range(1, len(conditions["columns"]) - inc):
-					des[j + inc] = row1[0][j]
+        for d in range(len(data1)):
+            dt = data1[d]
+            dt.insert(ind, "")
+            data.append(dt)
 
-				data.append(des)
-	else:
-		data = frappe.db.sql(
-			""" select {} from `tab{}` t1, `tab{} Item` t2 {}
-					where t2.parent = t1.name and t1.company = %(company)s and {} between %(year_start_date)s and %(year_end_date)s and
-					t1.docstatus = 1 {} {}
-					group by {}
-				""".format(
-				query_details,
-				conditions["trans"],
-				conditions["trans"],
-				conditions["addl_tables"],
-				posting_date,
-				cond,
-				conditions.get("addl_tables_relational_cond", ""),
-				conditions["group_by"],
-			),
-			sql_params,
-			as_list=1,
-		)
+            row = frappe.db.sql(
+                """select DISTINCT({}) from `tab{}` t1, `tab{} Item` t2 {}
+                    where t2.parent = t1.name and t1.company = %(company)s
+                      and {} between %(year_start_date)s and %(year_end_date)s
+                      and t1.docstatus = 1 and {} = %(group_val)s {} {}
+                """.format(
+                    sel_col,
+                    trans,
+                    trans,
+                    conditions["addl_tables"],
+                    posting_date,
+                    conditions["group_by"],
+                    conditions.get("addl_tables_relational_cond", ""),
+                    cond,
+                ),
+                dict(sql_params, group_val=data1[d][0]),
+                as_list=1,
+            )
 
-	return data
+            for i in range(len(row)):
+                des = ["" for q in range(len(conditions["columns"]))]
+
+                row1 = frappe.db.sql(
+                    """ select {} , {} from `tab{}` t1, `tab{} Item` t2 {}
+                        where t2.parent = t1.name and t1.company = %(company)s
+                          and {} between %(year_start_date)s and %(year_end_date)s
+                          and t1.docstatus = 1 and {} = %(sel_val)s and {} = %(group_val)s {} {}
+                    """.format(
+                        sel_col,
+                        conditions["period_wise_select"],
+                        trans,
+                        trans,
+                        conditions["addl_tables"],
+                        posting_date,
+                        sel_col,
+                        conditions["group_by"],
+                        conditions.get("addl_tables_relational_cond", ""),
+                        cond,
+                    ),
+                    dict(sql_params, sel_val=row[i][0], group_val=data1[d][0]),
+                    as_list=1,
+                )
+
+                des[ind] = row[i][0]
+                for j in range(1, len(conditions["columns"]) - inc):
+                    des[j + inc] = row1[0][j]
+                data.append(des)
+    else:
+        data = frappe.db.sql(
+            """ select {} from `tab{}` t1, `tab{} Item` t2 {}
+                where t2.parent = t1.name and t1.company = %(company)s
+                  and {} between %(year_start_date)s and %(year_end_date)s
+                  and t1.docstatus = 1 {} {}
+                group by {}
+            """.format(
+                query_details,
+                trans,
+                trans,
+                conditions["addl_tables"],
+                posting_date,
+                conditions.get("addl_tables_relational_cond", ""),
+                cond,
+                conditions["group_by"],
+            ),
+            sql_params,
+            as_list=1,
+        )
+
+    return data
 
 
 def get_inactive_customers(filters, conditions):
-	"""Get customers with no transactions in the selected period"""
-	year_start_date, year_end_date = frappe.get_cached_value(
-		"Fiscal Year", filters.get("fiscal_year"), ["year_start_date", "year_end_date"]
-	)
-	
-	posting_date = "posting_date"
-	if filters.period_based_on:
-		posting_date = filters.period_based_on
-	
-	# Get all customers (filter by industry if specified using child table)
-	if filters.get("industry"):
-		# Get customers that have the selected industry in their child
-		customer_list = frappe.db.sql("""
-			SELECT DISTINCT itl.parent
-			FROM `tabIndustry Type Detail` itl
-			WHERE itl.parenttype = 'Customer'
-			AND itl.industry_type_detail = %(industry)s
-		""", {'industry': filters.get("industry")}, as_list=1)
-		
-		if customer_list:
-			customer_names = [c[0] for c in customer_list]
-			all_customers = frappe.get_all(
-				"Customer",
-				filters={"disabled": 0, "name": ["in", customer_names]},
-				fields=["name", "customer_name", "territory"]
-			)
-		else:
-			# No customers with this industry
-			all_customers = []
-	else:
-		# Get all active customers
-		all_customers = frappe.get_all(
-			"Customer",
-			filters={"disabled": 0},
-			fields=["name", "customer_name", "territory"]
-		)
-	
-	# Get customers with ANY transactions in the period (ignore item/item_group filters)
-	active_customers = frappe.db.sql("""
-		SELECT DISTINCT si.customer
-		FROM `tabSales Invoice` si
-		WHERE si.company = %(company)s
-		AND si.{posting_date} BETWEEN %(year_start_date)s AND %(year_end_date)s
-		AND si.docstatus = 1
-	""".format(posting_date=posting_date), {
-		'company': filters.get("company"),
-		'year_start_date': year_start_date,
-		'year_end_date': year_end_date
-	}, as_dict=1)
-	
-	active_customer_set = {c.customer for c in active_customers}
-	
-	inactive_customers = [c for c in all_customers if c.name not in active_customer_set]
-	
-	# Build result with zeros for all periods
-	data = []
-	num_periods = len(conditions["columns"]) - 4  # Subtract: Customer, Name, Territory, Total
-	
-	for customer in inactive_customers:
-		row = [
-			customer.name,
-			customer.customer_name,
-			customer.territory
-		]
-		# Add zeros for all period columns
-		row.extend([0.0] * num_periods)
-		# Add total
-		row.append(0.0)
-		data.append(row)
-	
-	return data
+    year_start_date, year_end_date = frappe.get_cached_value(
+        "Fiscal Year", filters.get("fiscal_year"), ["year_start_date", "year_end_date"]
+    )
+
+    posting_date = "posting_date"
+    if filters.period_based_on:
+        posting_date = filters.period_based_on
+
+    # Allowed customers for this user
+    permitted_customers = set(frappe.get_list("Customer", pluck="name"))  # respects perms
+
+    # Filter customers by industry *and* perms
+    if filters.get("industry"):
+        inds = frappe.db.sql("""
+            SELECT DISTINCT itl.parent
+            FROM `tabIndustry Type Detail` itl
+            WHERE itl.parenttype = 'Customer' AND itl.industry_type_detail = %(industry)s
+        """, {'industry': filters.get("industry")}, as_list=1)
+        ind_set = {r[0] for r in inds} if inds else set()
+        allowed = list(permitted_customers.intersection(ind_set))
+        all_customers = frappe.get_list(
+            "Customer",
+            filters={"name": ["in", allowed], "disabled": 0},
+            fields=["name", "customer_name", "territory"],
+            limit_page_length=0,
+        )
+    else:
+        all_customers = frappe.get_list(
+            "Customer",
+            filters={"disabled": 0},
+            fields=["name", "customer_name", "territory"],
+            limit_page_length=0,
+        )
+
+    # Also enforce PQC for Customer in the activity scan
+    cust_pqc = _pqc("Customer")
+    cust_exists = ""
+    if cust_pqc:
+        cust_exists = f""" AND EXISTS (
+            SELECT 1 FROM `tabCustomer` cu
+            WHERE cu.name = si.customer AND {cust_pqc}
+        )"""
+
+    active_customers = frappe.db.sql(f"""
+        SELECT DISTINCT si.customer
+        FROM `tabSales Invoice` si
+        WHERE si.company = %(company)s
+          AND si.{posting_date} BETWEEN %(year_start_date)s AND %(year_end_date)s
+          AND si.docstatus = 1
+          {cust_exists}
+    """, {
+        'company': filters.get("company"),
+        'year_start_date': year_start_date,
+        'year_end_date': year_end_date
+    }, as_dict=1)
+
+    active_customer_set = {c.customer for c in active_customers}
+    inactive_customers = [c for c in all_customers if c["name"] not in active_customer_set]
+
+    data = []
+    num_periods = len(conditions["columns"]) - 4  # Customer, Name, Territory, Total
+
+    for customer in inactive_customers:
+        row = [customer["name"], customer["customer_name"], customer["territory"]]
+        row.extend([0.0] * num_periods)
+        row.append(0.0)
+        data.append(row)
+
+    return data
+
 
 
 def get_mon(dt):
